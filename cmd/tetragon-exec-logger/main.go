@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,6 +17,7 @@ import (
 	tetragon "github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/skpr/tetragon-exec-logger/internal/rules"
@@ -22,12 +25,53 @@ import (
 
 // Options for the command
 type Options struct {
-	Addr       string
-	ConfigFile string
+	Addr           string
+	ConfigFile     string
+	ConnectTimeout time.Duration
+}
+
+// waitForAddr blocks until the TCP addr is reachable or ctx is done.
+func waitForAddr(ctx context.Context, addr string, interval time.Duration) error {
+	d := net.Dialer{}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	for {
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			// retry
+		}
+	}
+}
+
+// waitForGRPCReady blocks until the gRPC connection reaches READY or ctx is done.
+func waitForGRPCReady(ctx context.Context, conn *grpc.ClientConn) error {
+	// Ensure dialing begins.
+	conn.Connect()
+
+	for {
+		st := conn.GetState()
+		if st == connectivity.Ready {
+			return nil
+		}
+
+		// Wait for any state change; returns false if ctx is done.
+		if !conn.WaitForStateChange(ctx, st) {
+			return ctx.Err()
+		}
+	}
 }
 
 func main() {
-	o := Options{}
+	o := &Options{}
 
 	cmd := &cobra.Command{
 		Use:   "tetragon-exec-logger",
@@ -40,6 +84,15 @@ func main() {
 
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
+
+			waitCtx, waitCancel := context.WithTimeout(ctx, o.ConnectTimeout)
+			defer waitCancel()
+
+			logger.Info("Waiting for addr to be reachable", "addr", o.Addr, "timeout", o.ConnectTimeout)
+
+			if err := waitForAddr(waitCtx, o.Addr, 500*time.Millisecond); err != nil {
+				return fmt.Errorf("addr %q not reachable within %s: %w", o.Addr, o.ConnectTimeout, err)
+			}
 
 			opts := []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -55,6 +108,14 @@ func main() {
 					logger.Error("failed to close gRPC connection", "error", err)
 				}
 			}()
+
+			logger.Info("Waiting for gRPC connection to become ready", "addr", o.Addr, "timeout", o.ConnectTimeout)
+
+			if err := waitForGRPCReady(waitCtx, conn); err != nil {
+				return fmt.Errorf("gRPC connection to %q not ready within %s: %w", o.Addr, o.ConnectTimeout, err)
+			}
+
+			logger.Info("Connected to Tetragon", "addr", o.Addr)
 
 			client := tetragon.NewFineGuidanceSensorsClient(conn)
 
@@ -72,8 +133,6 @@ func main() {
 			if err != nil {
 				return fmt.Errorf("failed to get event stream: %w", err)
 			}
-
-			logger.Info("Connecting to Tetragon", "addr", o.Addr)
 
 			config, err := rules.LoadConfigFromFile(o.ConfigFile)
 			if err != nil {
@@ -96,6 +155,7 @@ func main() {
 					}
 
 					logger.Error("stream recv", "error", err)
+					continue
 				}
 
 				pe := ev.GetProcessExec()
@@ -130,9 +190,9 @@ func main() {
 
 	cmd.PersistentFlags().StringVar(&o.Addr, "addr", env.String("SKPR_TETRAGON_EXEC_LOGGER_ADDR", "127.0.0.1:54321"), "Tetragon gRPC address host:port")
 	cmd.PersistentFlags().StringVar(&o.ConfigFile, "config-file", env.String("SKPR_TETRAGON_EXEC_LOGGER_CONFIG_FILE", "/etc/tetragon-exec-logger/config.yaml"), "Path to the config file")
+	cmd.PersistentFlags().DurationVar(&o.ConnectTimeout, "connect-timeout", 30*time.Second, "Max time to wait for addr to open and gRPC to become ready")
 
-	err := cmd.Execute()
-	if err != nil {
+	if err := cmd.Execute(); err != nil {
 		panic(err)
 	}
 }
